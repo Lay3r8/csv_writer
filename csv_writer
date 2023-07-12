@@ -1,0 +1,101 @@
+"""
+CSV writer thread
+"""
+from typing import Final
+from threading import Thread
+from time import sleep
+from pathlib import Path
+from queue import Queue
+from csv import writer as csv_writer
+from datetime import datetime
+from pytz import timezone
+from logging import INFO, DEBUG
+
+from lib.log import get_stdio_logger
+
+
+BRUSSELS_TZ: Final = timezone("Europe/Brussels")
+
+logger = get_stdio_logger(__name__)
+logger.setLevel(DEBUG)
+
+
+def today():
+    """Return today's date in YYYY-MM-DD format"""
+    return datetime.now(BRUSSELS_TZ).strftime("%Y-%m-%d")
+
+
+class CsvWriterThread(Thread):
+    """Keeps up daily CSVs about car data received from ALPR"""
+
+    def __init__(self, base_path: str, headers: list, fifo_queue: Queue, max_files: int=5) -> None:
+        super().__init__()
+        self.base_path = base_path
+        self.headers = headers
+        self.fifo_queue = fifo_queue
+        self.max_files = max_files
+        self.today = today()
+        self.csv_writer = self.get_csv_writer()
+        self.alive = True
+
+    def stop(self) -> None:
+        """Stop the thread"""
+        logger.info("Stopping CSV writer thread")
+        self.alive = False
+
+    def get_csv_file_path(self) -> str:
+        """Return the path to the CSV file for today"""
+        return f"{self.base_path}/report_{today()}.csv"
+
+    def get_csv_writer(self) -> csv_writer:
+        """Return a CSV writer for today's CSV file"""
+        csv_file_path = self.get_csv_file_path()
+        if Path(csv_file_path).is_file():
+            with open(csv_file_path, "a", encoding="utf-8") as csv_file:
+                writer = csv_writer(csv_file)
+        else:
+            with open(csv_file_path, "w", encoding="utf-8") as csv_file:
+                writer = csv_writer(csv_file)
+                writer.writerow(self.headers)
+        return writer
+
+    def csv_write(self, data: list) -> None:
+        """Write data to today's CSV file"""
+        csv_file_path = self.get_csv_file_path()
+        if Path(csv_file_path).is_file():
+            with open(csv_file_path, "a", encoding="utf-8") as csv_file:
+                writer = csv_writer(csv_file)
+                writer.writerow(data)
+        else:
+            with open(csv_file_path, "w", encoding="utf-8") as csv_file:
+                writer = csv_writer(csv_file)
+                writer.writerow(self.headers)
+                writer.writerow(data)
+
+    def enforce_max_files(self) -> None:
+        """Delete old CSV files when file number exceeds self.max_files in self.base_path"""
+        path = Path(self.base_path)
+        csv_files = list(path.glob("*.csv"))
+        if len(csv_files) >= self.max_files:
+            csv_files.sort(key=lambda x: x.stat().st_mtime)
+            csv_files[0].unlink()
+
+    def update_csv_writer(self) -> None:
+        """Update self.csv_writer if today has changed"""
+        t = today() # pylint: disable=invalid-name
+        if self.today != t:
+            self.csv_writer = self.get_csv_writer()
+            self.today = t
+
+    def run(self) -> None:
+        logger.info("CsvWriterThread started")
+        while self.alive:
+            sleep(1)
+            logger.debug("Polling...")
+            self.enforce_max_files()
+            self.update_csv_writer()
+            data = self.fifo_queue.get()
+            if data is None:
+                continue
+            logger.debug("Writing data to CSV file: %s", data)
+            self.csv_write(data)
